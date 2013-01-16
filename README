@@ -1,0 +1,25 @@
+This is a patch for R v2.16.0 (Unsuffered Consequences)
+that provides layered output for the pdf() graphics device.
+
+to install:
+cd [R-root]
+patch -p1<add_pdf_layers.diff
+
+The patch updates all the regression tests in 'make check'
+so they pass without noise with respect to what has changed.
+
+As of yet there is no automated test to check for proper 
+function of the layers in pdf().
+
+To use: 
+>pdf("file/name", onepage=TRUE)
+>plot(a figure)       #layer 0 (background)
+>plot(another figure) #layer 1 (foreground)
+>[continue...]
+>dev.off()
+
+Layers will render as expected in viewers such based on poppler
+and such, also in Adobe reader products.
+
+In Adobe professional products (CS# etc) the layers will appear 
+as analogous clipping groups.

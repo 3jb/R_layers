@@ -1,0 +1,1178 @@
+diff --git a/src/library/grDevices/R/postscript.R b/src/library/grDevices/R/postscript.R
+index 8d2eb16..b9610d2 100644
+--- a/src/library/grDevices/R/postscript.R
++++ b/src/library/grDevices/R/postscript.R
+@@ -290,7 +290,7 @@ xfig <- function (file = ifelse(onefile,"Rplots.fig", "Rplot%03d.fig"),
+ }
+ 
+ pdf <- function(file = ifelse(onefile, "Rplots.pdf", "Rplot%03d.pdf"),
+-                width, height, onefile, family, title, fonts, version,
++                width, height, onefile, onepage, family, title, fonts, version,
+                 paper, encoding, bg, fg, pointsize, pagecentre, colormodel,
+                 useDingbats, useKerning, fillOddEven, maxRasters,
+                 compress)
+@@ -298,10 +298,15 @@ pdf <- function(file = ifelse(onefile, "Rplots.pdf", "Rplot%03d.pdf"),
+     ## do initialization if needed
+     initPSandPDFfonts()
+ 
++    if(!missing(onepage) && !missing(onefile))
++      if(onepage && !onefile)
++	stop("cannot simultaneously set onepage=TRUE AND onefile=FALSE")
++
+     new <- list()
+     if(!missing(width)) new$width <- width
+     if(!missing(height)) new$height <- height
+     if(!missing(onefile)) new$onefile <- onefile
++    if(!missing(onepage)) new$onepage <- onepage
+     ## 'family' is handled separately
+     if(!missing(title)) new$title <- title
+     if(!missing(fonts)) new$fonts <- fonts
+@@ -358,6 +363,10 @@ pdf <- function(file = ifelse(onefile, "Rplots.pdf", "Rplot%03d.pdf"),
+     # Extract version
+     version <- old$version
+     versions <- c("1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "2.0")
++    if (old$onepage && version %in% c("1.1", "1.2", "1.3", "1.4")){
++      version = "1.5"
++      warning("version bumped to 1.5 to enable layer compatibility")
++    }
+     if (version %in% versions)
+         version <- as.integer(strsplit(version, "[.]")[[1L]])
+     else
+@@ -367,8 +376,8 @@ pdf <- function(file = ifelse(onefile, "Rplots.pdf", "Rplot%03d.pdf"),
+     if(!checkIntFormat(file)) stop("invalid 'file'")
+     .External(C_PDF,
+               file, old$paper, old$family, old$encoding, old$bg, old$fg,
+-              old$width, old$height, old$pointsize, onefile, old$pagecentre,
+-              old$title, old$fonts, version[1L], version[2L],
++              old$width, old$height, old$pointsize, old$onefile, old$onepage,
++	      old$pagecentre, old$title, old$fonts, version[1L], version[2L],
+               old$colormodel, old$useDingbats, old$useKerning,
+               old$fillOddEven, old$compress)
+     invisible()
+@@ -670,10 +679,11 @@ assign(".PDF.Options",
+     list(width	= 7,
+ 	 height = 7,
+          onefile = TRUE,
++	 onepage = FALSE,
+          family = "Helvetica",
+          title = "R Graphics Output",
+          fonts = NULL,
+-         version = "1.4",
++         version = "1.5",
+          paper = "special",
+          encoding = "default",
+ 	 bg	= "transparent",
+diff --git a/src/library/grDevices/man/pdf.Rd b/src/library/grDevices/man/pdf.Rd
+index 142bbc4..67164e5 100644
+--- a/src/library/grDevices/man/pdf.Rd
++++ b/src/library/grDevices/man/pdf.Rd
+@@ -39,6 +39,11 @@ pdf(file = ifelse(onefile, "Rplots.pdf", "Rplot\%03d.pdf"),
+     in one file.  If false, generate a file with name containing the page
+     number for each page.  Defaults to \code{TRUE}, and forced to true
+     if \code{file} is a pipe.}
++  \item{onepage}{logical: if true (default false) onefile will be set
++    to true, version will be minimum 1.5, and a generated sequence of 
++    figures will be stacked in "layers" within the output of this device.
++    Figures provided first will appear on [lower / background] layers and 
++    the final figure will have the highest layer number, appearing "on top".}
+   \item{family}{the font family to be used, see
+     \code{\link{postscript}}.  Defaults to \code{"Helvetica"}.}
+   \item{title}{title string to embed as the \samp{/Title} field in the
+diff --git a/src/library/grDevices/src/devPS.c b/src/library/grDevices/src/devPS.c
+index 25d8c9f..eb58b8f 100644
+--- a/src/library/grDevices/src/devPS.c
++++ b/src/library/grDevices/src/devPS.c
+@@ -5362,6 +5362,7 @@ typedef struct {
+     char papername[64];	/* paper name */
+     int paperwidth;	/* paper width in big points (1/72 in) */
+     int paperheight;	/* paper height in big points */
++    int layerno;	/* layer number */
+     int pageno;		/* page number */
+     int fileno;		/* file number */
+ 
+@@ -5373,6 +5374,7 @@ typedef struct {
+     double pageheight;	/* page height in inches */
+     Rboolean pagecentre;  /* centre image on page? */
+     Rboolean onefile;	/* one file or one file per page? */
++    Rboolean onepage;	/* one file, or one page with layers? */
+ 
+     FILE *pdffp;        /* output file */
+     FILE *mainfp;
+@@ -5417,6 +5419,11 @@ typedef struct {
+     int nobjs;  /* number of objects */
+     int *pos; /* object positions */
+     int max_nobjs; /* current allocation size */
++    int *ocgobjs;  /*reserved OCG object numbers*/
++    int *colorobjs; /*reserved color space object numbers*/
++    int *layerobj; /* layer object numbers */
++    int layermax;
++    Rboolean freshlayer;
+     int *pageobj; /* page object numbers */
+     int pagemax;
+     int startstream; /* position of start of current stream */
+@@ -5477,6 +5484,11 @@ void PDF_MetricInfo(int c,
+                     double* ascent, double* descent,
+                     double* width, pDevDesc dd);
+ static void PDF_NewPage(const pGEcontext gc, pDevDesc dd);
++static void PDF_NewLayer(const pGEcontext gc, pDevDesc dd);
++static void PDF_endlayer(PDFDesc *pd);
++static void PDF_buildlayermap(PDFDesc *pd);
++static void PDF_ocobjects(PDFDesc *pd);
++static void PDF_listlayers(PDFDesc *pd);
+ static void PDF_Polygon(int n, double *x, double *y,
+ 			const pGEcontext gc,
+ 			pDevDesc dd);
+@@ -5639,7 +5651,7 @@ static void writeRasterXObject(rasterImage raster, int n,
+     if (streql(pd->colormodel, "gray"))
+ 	fprintf(pd->pdffp, "  /ColorSpace /DeviceGray\n");
+     else if (streql(pd->colormodel, "srgb"))
+-	fprintf(pd->pdffp, "  /ColorSpace 5 0 R\n"); /* sRGB */
++	fprintf(pd->pdffp, "  /ColorSpace %d 0 R\n", pd->colorobjs[0]); /* sRGB */
+     else
+ 	fprintf(pd->pdffp, "  /ColorSpace /DeviceRGB\n");
+     fprintf(pd->pdffp, "  /BitsPerComponent 8\n");
+@@ -5778,17 +5790,23 @@ static Rboolean addPDFDevicefont(type1fontfamily family,
+ 
+ static void PDFcleanup(int stage, PDFDesc *pd) {
+     switch (stage) {
+-    case 6: /* Allocated masks */
++    case 9: /* Allocated masks */
+ 	free(pd->masks);
+-    case 5: /* Allocated rasters */
++    case 8: /* Allocated rasters */
+ 	free(pd->rasters);
+-    case 4: /* Allocated fonts */
++    case 7: /* Allocated fonts */
+ 	freeDeviceFontList(pd->fonts);
+ 	freeDeviceCIDFontList(pd->cidfonts);
+ 	freeDeviceEncList(pd->encodings);
+ 	pd->fonts = NULL;
+ 	pd->cidfonts = NULL;
+ 	pd->encodings = NULL;
++    case 6: /* Allocated colorobjs*/
++	free(pd->colorobjs);
++    case 5: /* Allocated ocgobjs */
++	free(pd->ocgobjs);
++    case 4: /* Allocated layerobj */
++	free(pd->layerobj);
+     case 3: /* Allocated pageobj */
+ 	free(pd->pageobj);
+     case 2: /* Allocated pos */
+@@ -5803,7 +5821,7 @@ PDFDeviceDriver(pDevDesc dd, const char *file, const char *paper,
+ 		const char *family, const char **afmpaths,
+ 		const char *encoding,
+ 		const char *bg, const char *fg, double width, double height,
+-		double ps, int onefile, int pagecentre,
++		double ps, int onefile, int onepage, int pagecentre,
+ 		const char *title, SEXP fonts,
+ 		int versionMajor, int versionMinor,
+ 		const char *colormodel, int dingbats, int useKern,
+@@ -5861,7 +5879,27 @@ PDFDeviceDriver(pDevDesc dd, const char *file, const char *paper,
+ 	free(dd);
+ 	error("cannot allocate pd->pageobj");
+     }
+-
++    pd->freshlayer = FALSE;
++    /* This one is dynamic: initial allocation */
++    pd->layermax = 100;
++    pd->layerobj = (int *) calloc(pd->layermax, sizeof(int));
++    if(!pd->layerobj) {
++	PDFcleanup(3, pd);
++	free(dd);
++	error("cannot allocate pd->layerobj");
++    }
++    pd->ocgobjs = (int *) calloc(2, sizeof(int));
++    if(!pd->ocgobjs) {
++	PDFcleanup(4, pd);
++	free(dd);
++	error("cannot allocate pd->ocgobjs");
++    }
++    pd->colorobjs = (int *) calloc(2, sizeof(int));
++    if(!pd->colorobjs) {
++	PDFcleanup(5, pd);
++	free(dd);
++	error("cannot allocate pd->colorobjs");
++    }
+ 
+     /* initialize PDF device description */
+     /* 'file' could be NULL */
+@@ -6029,7 +6067,7 @@ PDFDeviceDriver(pDevDesc dd, const char *file, const char *paper,
+ 	    }
+ 	}
+ 	if (gotFonts < nfonts) {
+-	    PDFcleanup(4, pd);
++	    PDFcleanup(7, pd);
+ 	    free(dd);
+ 	    error(_("failed to initialise additional PDF fonts"));
+ 	}
+@@ -6042,14 +6080,14 @@ PDFDeviceDriver(pDevDesc dd, const char *file, const char *paper,
+     pd->maxRasters = 64; /* dynamic */
+     pd->rasters = initRasterArray(pd->maxRasters);
+     if (!pd->rasters) {
+-	PDFcleanup(4, pd);
++	PDFcleanup(7, pd);
+ 	free(dd);
+ 	error(_("failed to allocate rasters"));
+     }
+     pd->numMasks = 0;
+     pd->masks = initMaskArray(pd->maxRasters);
+     if (!pd->masks) {
+-	PDFcleanup(5, pd);
++	PDFcleanup(8, pd);
+ 	free(dd);
+ 	error(_("failed to allocate masks"));
+     }
+@@ -6112,7 +6150,7 @@ PDFDeviceDriver(pDevDesc dd, const char *file, const char *paper,
+       pd->pageheight = height;
+     }
+     else {
+-	PDFcleanup(6, pd);
++	PDFcleanup(9, pd);
+ 	free(dd);
+ 	error(_("invalid paper type '%s' (pdf)"), pd->papername);
+     }
+@@ -6136,15 +6174,17 @@ PDFDeviceDriver(pDevDesc dd, const char *file, const char *paper,
+ 
+     pointsize = floor(ps);
+     if(R_TRANSPARENT(setbg) && R_TRANSPARENT(setfg)) {
+-	PDFcleanup(6, pd);
++	PDFcleanup(9, pd);
+ 	free(dd);
+ 	error(_("invalid foreground/background color (pdf)"));
+     }
+ 
+-    pd->onefile = onefile;
++    pd->onepage = onepage;
++    //If onepage is lit-up, then we obviously only want one file.
++    pd->onefile = onefile || onepage;
+     pd->maxpointsize = (int)(72.0 * ((pd->pageheight > pd->pagewidth) ?
+ 				     pd->pageheight : pd->pagewidth));
+-    pd->pageno = pd->fileno = 0;
++    pd->pageno = pd->fileno = pd->layerno = 0;
+     /* Base Pointsize */
+     /* Nominal Character Sizes in Pixels */
+     /* Only right for 12 point font. */
+@@ -6191,9 +6231,15 @@ PDFDeviceDriver(pDevDesc dd, const char *file, const char *paper,
+     /*	Start the driver */
+     PDF_Open(dd, pd); /* errors on failure */
+ 
++    if(onepage) {
++      dd->newPage    = PDF_NewLayer;
++    } else {
++      dd->newPage    = PDF_NewPage;
++    }
++
++
+     dd->close      = PDF_Close;
+     dd->size     = PDF_Size;
+-    dd->newPage    = PDF_NewPage;
+     dd->clip	      = PDF_Clip;
+     dd->text	      = PDF_Text;
+     dd->strWidth   = PDF_StrWidth;
+@@ -6612,13 +6658,22 @@ static void PDF_startfile(PDFDesc *pd)
+ 	    R_MAJOR, R_MINOR);
+ 
+     /* Object 2 is the Catalog, pointing to pages list in object 3 (at end) */
+-
++    //reserve and mark object 2
+     pd->pos[++pd->nobjs] = (int) ftell(pd->pdffp);
+-    fprintf(pd->pdffp, "2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
+-
+-    /* Objects at the end */
+-    pd->nobjs += 2;
+-    if (streql(pd->colormodel, "srgb")) pd->nobjs += 2;
++    //reserve object 3 for pages and 4 for resources
++    pd->nobjs +=2;
++    fprintf(pd->pdffp, "2 0 obj\n<</Type/Catalog/Pages 3 0 R");
++    //because contidionals: may shuffle the remaining obj numbers
++    if(pd->onepage){
++      for(int i=0; i<2; i++) { pd->ocgobjs[i] = ++pd->nobjs; }
++      fprintf(pd->pdffp,"/OCProperties<</D %d 0 R/OCGs %d 0 R>>",
++	       pd->ocgobjs[0], pd->ocgobjs[1]);
++    }
++    fprintf(pd->pdffp, ">>\nendobj\n");
++    //reserve the object numbers for the colormodel 
++    if (streql(pd->colormodel, "srgb")){
++      for(int i=0; i<2; i++) { pd->colorobjs[i] = ++pd->nobjs; }
++    }
+ }
+ 
+ static const char *Base14[] =
+@@ -6668,15 +6723,17 @@ static void PDF_endfile(PDFDesc *pd)
+     int i, startxref, tempnobj, nenc, nfonts, cidnfonts, firstencobj;
+     int nraster, nmask;
+ 
++    /* insert all optional content objects */
++    PDF_ocobjects(pd);
++
+     /* object 3 lists all the pages */
+ 
+     pd->pos[3] = (int) ftell(pd->pdffp);
+     fprintf(pd->pdffp, "3 0 obj\n<< /Type /Pages /Kids [ ");
+     for(i = 0; i < pd->pageno; i++)
+ 	fprintf(pd->pdffp, "%d 0 R ", pd->pageobj[i]);
+-
+     fprintf(pd->pdffp,
+-	    "] /Count %d /MediaBox [0 0 %d %d] >>\nendobj\n",
++	    "] /Count %d >>\nendobj\n",
+ 	    pd->pageno,
+ 	    (int) (0.5 + pd->paperwidth), (int) (0.5 + pd->paperheight));
+ 
+@@ -6758,7 +6815,7 @@ static void PDF_endfile(PDFDesc *pd)
+ 	}
+     }
+     fprintf(pd->pdffp, ">>\n");
+-
++    PDF_buildlayermap(pd);
+     if (nraster > 0) {
+ 	/* image XObjects */
+ 	fprintf(pd->pdffp, "/XObject <<\n");
+@@ -6781,20 +6838,36 @@ static void PDF_endfile(PDFDesc *pd)
+     if (nmask > 0)
+ 	fprintf(pd->pdffp, "/GSais %d 0 R ", ++tempnobj);
+     fprintf(pd->pdffp, ">>\n");
+-
+     if (streql(pd->colormodel, "srgb")) {
+-	/* Objects 5 and 6 are the sRGB color space, if required */
+-	fprintf(pd->pdffp, "/ColorSpace << /sRGB 5 0 R >>\n");
++	/* sRGB color space, if required */
++	fprintf(pd->pdffp, "/ColorSpace << /sRGB %d 0 R >>\n", pd->colorobjs[0]);
+ 	fprintf(pd->pdffp, ">>\nendobj\n");
+-	pd->pos[5] = (int) ftell(pd->pdffp);
+-	fprintf(pd->pdffp, "5 0 obj\n[/ICCBased 6 0 R]\nendobj\n");
+-	pd->pos[6] = (int) ftell(pd->pdffp);
+-	fprintf(pd->pdffp, "6 0 obj\n");
++	pd->pos[pd->colorobjs[0]] = (int) ftell(pd->pdffp);
++	fprintf(pd->pdffp, "%d 0 obj\n[/ICCBased %d 0 R]\nendobj\n", 
++			    pd->colorobjs[0], pd->colorobjs[1]);
++	pd->pos[pd->colorobjs[1]] = (int) ftell(pd->pdffp);
++	fprintf(pd->pdffp, "%d 0 obj\n", pd->colorobjs[1]);
+ 	PDFwritesRGBcolorspace(pd);    
+ 	fprintf(pd->pdffp, "endobj\n");
+     } else {
+     	fprintf(pd->pdffp, ">>\nendobj\n");
+     }
++    if(pd->layerno > 0){
++      /*Optional Content dictionary*/
++      pd->pos[pd->ocgobjs[0]] = (int)ftell(pd->pdffp);
++      fprintf(pd->pdffp, "%d 0 obj\n<</ON[", pd->ocgobjs[0]);
++      PDF_listlayers(pd);
++      fprintf(pd->pdffp, "]/OFF[]/Order[");
++      PDF_listlayers(pd);
++      fprintf(pd->pdffp, "]/RBGroups[]>>\nendobj\n");
++
++      /*Optional content object membership*/
++      pd->pos[pd->ocgobjs[1]] = (int)ftell(pd->pdffp);
++      fprintf(pd->pdffp, "%d 0 obj\n[", pd->ocgobjs[1]);
++      PDF_listlayers(pd);
++      fprintf(pd->pdffp, "]\nendobj\n");
++    }
++
+ 
+     if(tempnobj >= pd->max_nobjs) {
+ 	int new = tempnobj + 500;
+@@ -6969,6 +7042,8 @@ static void PDF_endfile(PDFDesc *pd)
+ 	}
+     }
+ 
++///////////////////////////////////////////////////////
++
+     /*
+      * Write out objects representing the graphics state parameter
+      * dictionaries for alpha transparency
+@@ -7041,7 +7116,7 @@ static Rboolean PDF_Open(pDevDesc dd, PDFDesc *pd)
+ 	errno = 0;
+ 	pd->pipefp = R_popen(pd->cmd, "w");
+ 	if (!pd->pipefp || errno != 0) {
+-	    PDFcleanup(6, pd);
++	    PDFcleanup(9, pd);
+ 	    error(_("cannot open 'pdf' pipe to '%s'"), pd->cmd);
+ 	    return FALSE;
+ 	}
+@@ -7056,7 +7131,7 @@ static Rboolean PDF_Open(pDevDesc dd, PDFDesc *pd)
+        as well as allowing binary streams */
+     pd->mainfp = R_fopen(R_ExpandFileName(buf), "wb");
+     if (!pd->mainfp) {
+-	PDFcleanup(6, pd);
++	PDFcleanup(9, pd);
+ 	free(dd);	
+ 	error(_("cannot open file '%s'"), buf);
+     }
+@@ -7068,10 +7143,19 @@ static Rboolean PDF_Open(pDevDesc dd, PDFDesc *pd)
+ 
+ static void pdfClip(double x0, double x1, double y0, double y1, PDFDesc *pd)
+ {
+-    if(x0 != 0.0 || y0 != 0.0 || x1 != 72*pd->width || y1 != 72*pd->height)
+-	fprintf(pd->pdffp, "Q q %.2f %.2f %.2f %.2f re W n\n",
++    /* To mimic layers in CS products: Create a clipping 
++     * heirarchy that will represent layers (forcing analogous groups).
++     * Not popping the graphics state before the first clip in the new 
++     * "layer" is created precpitates a tree instead of a flat list. */
++    if( !pd->freshlayer ) 
++      fprintf(pd->pdffp, "Q ");
++    //after this is done once, layer is no longer "fresh"
++    pd->freshlayer=FALSE; 
++    if(x0 != 0.0 || y0 != 0.0 || x1 != 72*pd->width || y1 != 72*pd->height){
++	fprintf(pd->pdffp, "q %.2f %.2f %.2f %.2f re W n\n",
+ 		x0, y0, x1 - x0, y1 - y0);
+-    else fprintf(pd->pdffp, "Q q\n");
++    //This is here to properly end the clipping scope
++    } else { fprintf(pd->pdffp, "q\n"); }
+ }
+ 
+ static void PDF_Clip(double x0, double x1, double y0, double y1, pDevDesc dd)
+@@ -7094,10 +7178,43 @@ static void PDF_Size(double *left, double *right,
+     *bottom = dd->bottom;
+     *top = dd->top;
+ }
+-
++static void PDF_endlayer(PDFDesc *pd)
++{
++  /* Pop two graphics states off the stack:
++   *  -the last clipping boundry
++   *  -the layer clipping group 
++   */
++  if(pd->layerno > 0)fprintf(pd->pdffp, "Q Q\nEMC\n");
++}
++static void PDF_buildlayermap(PDFDesc *pd)
++{
++  if(pd->layerno > 0){
++    fprintf(pd->pdffp, "/Properties <<");
++    for (int i=0; i<pd->layerno; i++) {
++      fprintf(pd->pdffp, "/MC%d %d 0 R ", i, pd->layerobj[i]);
++    }
++    fprintf(pd->pdffp,">>\n");
++  }
++}
++static void PDF_ocobjects(PDFDesc *pd)
++{
++  for(int i=0; i<pd->layerno;i++){
++    pd->layerobj[i] = ++pd->nobjs;
++    pd->pos[pd->nobjs] = (int) ftell(pd->pdffp);
++    fprintf(pd->pdffp, "%d 0 obj", pd->layerobj[i]);
++    fprintf(pd->pdffp, "<</Type/OCG/Name(Layer %d)/Intent[/View/Design]>>\nendobj\n", i);
++  }  
++}
++static void PDF_listlayers(PDFDesc *pd)
++{
++  for(int i=0; i<pd->layerno; i++){
++    fprintf(pd->pdffp, " %d 0 R", pd->layerobj[i]);
++  }
++}
+ static void PDF_endpage(PDFDesc *pd)
+ {
+     if(pd->inText) textoff(pd);
++    PDF_endlayer(pd);
+     fprintf(pd->pdffp, "Q\n");
+     if (pd->useCompression) {
+ 	fflush(pd->pdffp);
+@@ -7158,6 +7275,47 @@ static void PDF_endpage(PDFDesc *pd)
+ 
+ #define R_VIS(col) (R_ALPHA(col) > 0)
+ 
++static void PDF_NewLayer(const pGEcontext gc,
++			pDevDesc dd)
++{
++    PDFDesc *pd = (PDFDesc *) dd->deviceSpecific;
++    char buf[512];
++
++    PDF_checkOffline();
++
++    if(pd->layerno >= pd->layermax) {
++	void * tmp = realloc(pd->layerobj, 2*pd->layermax * sizeof(int));
++	if(!tmp)
++	    error("unable to increase layer limit: please shutdown the pdf device");
++	pd->layerobj = (int *) tmp;
++	pd->layermax *= 2;
++    }
++    if(pd->nobjs + 500 >= pd->max_nobjs) {
++	int new = pd->max_nobjs + 2000;
++	void *tmp = realloc(pd->pos, new * sizeof(int));
++	if(!tmp)
++	    error("unable to increase object limit: please shutdown the pdf device");
++	pd->pos = (int *) tmp;
++	pd->max_nobjs = new;
++    }
++    if(pd->layerno < 1){
++      PDF_NewPage(gc, dd);
++    }else{
++      PDF_endlayer(pd);
++    }
++    //assign this layer an object number‚Ä¶
++    //don't set position of object because object not here
++    //pd->layerobj[pd->layerno] = ++pd->nobjs;
++    /* Create the new layer, or "optional content" object:                 */
++    /* Adobe products (other than acrobat) ironically don't properly honor */ 
++    /* optional content, so a clipping layer the size of the MediaBox      */
++    /* (entire page) is added to make Adobe think we need to group these   */
++    /* objects for clipping, so they'll show up at least grouped, which is */
++    /* easy enough to convert to layers in PS AI‚Ä¶ what have you.           */
++    fprintf(pd->pdffp, "/OC /MC%d BDC\nq 0 0 %d %d re W n\n", pd->layerno++,
++			(int) (0.5 + pd->paperwidth), (int) (0.5 + pd->paperheight));
++    pd->freshlayer=TRUE;
++}
+ static void PDF_NewPage(const pGEcontext gc,
+ 			pDevDesc dd)
+ {
+@@ -7199,8 +7357,10 @@ static void PDF_NewPage(const pGEcontext gc,
+ 
+     pd->pos[++pd->nobjs] = (int) ftell(pd->pdffp);
+     pd->pageobj[pd->pageno++] = pd->nobjs;
+-    fprintf(pd->pdffp, "%d 0 obj\n<< /Type /Page /Parent 3 0 R /Contents %d 0 R /Resources 4 0 R >>\nendobj\n",
+-	    pd->nobjs, pd->nobjs+1);
++    fprintf(pd->pdffp, "%d 0 obj\n<< /Type /Page /Parent 3 0 R", pd->nobjs);
++    fprintf(pd->pdffp, "/Contents %d 0 R /Resources 4 0 R ", pd->nobjs+1);
++    fprintf(pd->pdffp, "/MediaBox [0 0 %d %d] >>\nendobj\n",
++	     (int) (0.5 + pd->paperwidth), (int) (0.5 + pd->paperheight));
+     pd->pos[++pd->nobjs] = (int) ftell(pd->pdffp);
+     if (pd->useCompression) {
+ 	char *tmp = R_tmpnam("pdf", R_TempDir);
+@@ -7247,7 +7407,7 @@ static void PDF_Close(pDevDesc dd)
+         /* may no longer be needed */
+         killRasterArray(pd->rasters, pd->maxRasters);
+     }
+-    PDFcleanup(6, pd); /* which frees masks and rasters */
++    PDFcleanup(9, pd); /* which frees masks and rasters */
+ }
+ 
+ static void PDF_Rect(double x0, double y0, double x1, double y1,
+@@ -8354,7 +8514,7 @@ SEXP PDF(SEXP args)
+ 	*bg, *fg, *title, call[] = "PDF", *colormodel;
+     const char *afms[5];
+     double height, width, ps;
+-    int i, onefile, pagecentre, major, minor, dingbats, useKern, useCompression;
++    int i, onefile, onepage, pagecentre, major, minor, dingbats, useKern, useCompression;
+     SEXP fam, fonts;
+     Rboolean fillOddEven;
+ 
+@@ -8381,6 +8541,7 @@ SEXP PDF(SEXP args)
+     height = asReal(CAR(args));	      args = CDR(args);
+     ps = asReal(CAR(args));           args = CDR(args);
+     onefile = asLogical(CAR(args)); args = CDR(args);
++    onepage = asLogical(CAR(args)); args = CDR(args);
+     pagecentre = asLogical(CAR(args));args = CDR(args);
+     title = translateChar(asChar(CAR(args))); args = CDR(args);
+     fonts = CAR(args); args = CDR(args);
+@@ -8407,7 +8568,7 @@ SEXP PDF(SEXP args)
+ 	if (!(dev = (pDevDesc) calloc(1, sizeof(DevDesc))))
+ 	    return 0;
+ 	if(!PDFDeviceDriver(dev, file, paper, family, afms, encoding, bg, fg,
+-			    width, height, ps, onefile, pagecentre,
++			    width, height, ps, onefile, onepage, pagecentre,
+ 			    title, fonts, major, minor, colormodel,
+ 			    dingbats, useKern, fillOddEven,
+ 			    useCompression)) {
+diff --git a/src/library/grDevices/src/grDevices.h b/src/library/grDevices/src/grDevices.h
+index 001c4da..fec0569 100644
+--- a/src/library/grDevices/src/grDevices.h
++++ b/src/library/grDevices/src/grDevices.h
+@@ -60,7 +60,7 @@ PSDeviceDriver(pDevDesc, const char*, const char*, const char*,
+ Rboolean
+ PDFDeviceDriver(pDevDesc, const char *, const char *, const char *,
+ 		const char **, const char *, const char *, const char *,
+-		double, double, double, int, int, const char*, SEXP,
++		double, double, double, int, int, int, const char*, SEXP,
+ 		int, int, const char *, int, int, Rboolean, Rboolean);
+ 
+ #ifdef WIN32
+diff --git a/tests/Examples/grDevices-Ex.Rout.save b/tests/Examples/grDevices-Ex.Rout.save
+index 250e286..969802c 100644
+--- a/tests/Examples/grDevices-Ex.Rout.save
++++ b/tests/Examples/grDevices-Ex.Rout.save
+@@ -2499,14 +2499,15 @@ Sturges   Scott      FD
+ > 
+ > pdf.options(bg = "pink")
+ > utils::str(pdf.options())
+-List of 18
++List of 19
+  $ width      : num 7
+  $ height     : num 7
+  $ onefile    : logi TRUE
++ $ onepage    : logi FALSE
+  $ family     : chr "Helvetica"
+  $ title      : chr "R Graphics Output"
+  $ fonts      : NULL
+- $ version    : chr "1.4"
++ $ version    : chr "1.5"
+  $ paper      : chr "special"
+  $ encoding   : chr "default"
+  $ bg         : chr "pink"
+diff --git a/tests/reg-plot-latin1.pdf.save b/tests/reg-plot-latin1.pdf.save
+index 937f4ac..b3543b7 100644
+--- a/tests/reg-plot-latin1.pdf.save
++++ b/tests/reg-plot-latin1.pdf.save
+@@ -1,19 +1,19 @@
+-%PDF-1.4
++%PDF-1.5
+ %Å‚Å„ÅœÅ”\r
+ 1 0 obj
+ <<
+-/CreationDate (D:20111223173439)
+-/ModDate (D:20111223173439)
++/CreationDate (D:20130115235305)
++/ModDate (D:20130115235305)
+ /Title (R Graphics Output)
+ /Producer (R 2.16.0)
+ /Creator (R)
+ >>
+ endobj
+ 2 0 obj
+-<< /Type /Catalog /Pages 3 0 R >>
++<</Type/Catalog/Pages 3 0 R>>
+ endobj
+ 7 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 8 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 8 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 8 0 obj
+ <<
+@@ -146,7 +146,7 @@ endobj
+ 2512
+ endobj
+ 10 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 11 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 11 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 11 0 obj
+ <<
+@@ -387,7 +387,7 @@ endobj
+ 5085
+ endobj
+ 3 0 obj
+-<< /Type /Pages /Kids [ 7 0 R 10 0 R ] /Count 2 /MediaBox [0 0 841 595] >>
++<< /Type /Pages /Kids [ 7 0 R 10 0 R ] /Count 2 >>
+ endobj
+ 4 0 obj
+ <<
+@@ -630,23 +630,23 @@ xref
+ 0000000000 65535 f 
+ 0000000021 00000 n 
+ 0000000164 00000 n 
+-0000008119 00000 n 
+-0000008209 00000 n 
+-0000008355 00000 n 
+-0000008388 00000 n 
+-0000000213 00000 n 
+-0000000293 00000 n 
+-0000002857 00000 n 
+-0000002877 00000 n 
+-0000002959 00000 n 
+-0000008098 00000 n 
+-0000017924 00000 n 
+-0000018182 00000 n 
+-0000018266 00000 n 
+-0000018364 00000 n 
+-0000018467 00000 n 
++0000008161 00000 n 
++0000008227 00000 n 
++0000008373 00000 n 
++0000008406 00000 n 
++0000000209 00000 n 
++0000000312 00000 n 
++0000002876 00000 n 
++0000002896 00000 n 
++0000003001 00000 n 
++0000008140 00000 n 
++0000017942 00000 n 
++0000018200 00000 n 
++0000018284 00000 n 
++0000018382 00000 n 
++0000018485 00000 n 
+ trailer
+ << /Size 18 /Info 1 0 R /Root 2 0 R >>
+ startxref
+-18545
++18563
+ %%EOF
+diff --git a/tests/reg-plot.pdf.save b/tests/reg-plot.pdf.save
+index 0e9c2dd..675860a 100644
+--- a/tests/reg-plot.pdf.save
++++ b/tests/reg-plot.pdf.save
+@@ -1,19 +1,19 @@
+-%PDF-1.4
++%PDF-1.5
+ %Å‚Å„ÅœÅ”\r
+ 1 0 obj
+ <<
+-/CreationDate (D:20120516160845)
+-/ModDate (D:20120516160845)
++/CreationDate (D:20130115235259)
++/ModDate (D:20130115235259)
+ /Title (R Graphics Output)
+ /Producer (R 2.16.0)
+ /Creator (R)
+ >>
+ endobj
+ 2 0 obj
+-<< /Type /Catalog /Pages 3 0 R >>
++<</Type/Catalog/Pages 3 0 R>>
+ endobj
+ 7 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 8 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 8 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 8 0 obj
+ <<
+@@ -106,7 +106,7 @@ endobj
+ 1630
+ endobj
+ 10 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 11 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 11 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 11 0 obj
+ <<
+@@ -793,7 +793,7 @@ endobj
+ 14165
+ endobj
+ 13 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 14 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 14 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 14 0 obj
+ <<
+@@ -1026,7 +1026,7 @@ endobj
+ 4809
+ endobj
+ 16 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 17 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 17 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 17 0 obj
+ <<
+@@ -1259,7 +1259,7 @@ endobj
+ 4945
+ endobj
+ 19 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 20 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 20 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 20 0 obj
+ <<
+@@ -1463,7 +1463,7 @@ endobj
+ 3475
+ endobj
+ 22 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 23 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 23 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 23 0 obj
+ <<
+@@ -1865,7 +1865,7 @@ endobj
+ 6645
+ endobj
+ 25 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 26 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 26 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 26 0 obj
+ <<
+@@ -1958,7 +1958,7 @@ endobj
+ 1682
+ endobj
+ 28 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 29 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 29 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 29 0 obj
+ <<
+@@ -2150,7 +2150,7 @@ endobj
+ 4095
+ endobj
+ 31 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 32 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 32 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 32 0 obj
+ <<
+@@ -3275,7 +3275,7 @@ endobj
+ 18336
+ endobj
+ 34 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 35 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 35 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 35 0 obj
+ <<
+@@ -3497,7 +3497,7 @@ endobj
+ 3292
+ endobj
+ 37 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 38 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 38 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 38 0 obj
+ <<
+@@ -3719,7 +3719,7 @@ endobj
+ 3290
+ endobj
+ 40 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 41 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 41 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 41 0 obj
+ <<
+@@ -3766,7 +3766,7 @@ endobj
+ 629
+ endobj
+ 43 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 44 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 44 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 44 0 obj
+ <<
+@@ -3871,7 +3871,7 @@ endobj
+ 1813
+ endobj
+ 46 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 47 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 47 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 47 0 obj
+ <<
+@@ -4006,7 +4006,7 @@ endobj
+ 2634
+ endobj
+ 49 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 50 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 50 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 50 0 obj
+ <<
+@@ -4133,7 +4133,7 @@ endobj
+ 2268
+ endobj
+ 52 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 53 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 53 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 53 0 obj
+ <<
+@@ -4245,7 +4245,7 @@ endobj
+ 1944
+ endobj
+ 55 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 56 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 56 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 56 0 obj
+ <<
+@@ -4351,7 +4351,7 @@ endobj
+ 1914
+ endobj
+ 58 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 59 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 59 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 59 0 obj
+ <<
+@@ -4439,7 +4439,7 @@ endobj
+ 1468
+ endobj
+ 61 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 62 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 62 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 62 0 obj
+ <<
+@@ -4493,7 +4493,7 @@ endobj
+ 656
+ endobj
+ 64 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 65 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 65 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 65 0 obj
+ <<
+@@ -4563,7 +4563,7 @@ endobj
+ 1038
+ endobj
+ 67 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 68 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 68 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 68 0 obj
+ <<
+@@ -4608,7 +4608,7 @@ endobj
+ 522
+ endobj
+ 70 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 71 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 71 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 71 0 obj
+ <<
+@@ -4653,7 +4653,7 @@ endobj
+ 535
+ endobj
+ 73 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 74 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 74 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 74 0 obj
+ <<
+@@ -4747,7 +4747,7 @@ endobj
+ 1514
+ endobj
+ 76 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 77 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 77 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 77 0 obj
+ <<
+@@ -4793,7 +4793,7 @@ endobj
+ 625
+ endobj
+ 79 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 80 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 80 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 80 0 obj
+ <<
+@@ -4839,7 +4839,7 @@ endobj
+ 480
+ endobj
+ 82 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 83 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 83 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 83 0 obj
+ <<
+@@ -4915,7 +4915,7 @@ endobj
+ 1242
+ endobj
+ 85 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 86 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 86 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 86 0 obj
+ <<
+@@ -4991,7 +4991,7 @@ endobj
+ 1220
+ endobj
+ 88 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 89 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 89 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 89 0 obj
+ <<
+@@ -5067,7 +5067,7 @@ endobj
+ 1230
+ endobj
+ 91 0 obj
+-<< /Type /Page /Parent 3 0 R /Contents 92 0 R /Resources 4 0 R >>
++<< /Type /Page /Parent 3 0 R/Contents 92 0 R /Resources 4 0 R /MediaBox [0 0 841 595] >>
+ endobj
+ 92 0 obj
+ <<
+@@ -5159,7 +5159,7 @@ endobj
+ 1575
+ endobj
+ 3 0 obj
+-<< /Type /Pages /Kids [ 7 0 R 10 0 R 13 0 R 16 0 R 19 0 R 22 0 R 25 0 R 28 0 R 31 0 R 34 0 R 37 0 R 40 0 R 43 0 R 46 0 R 49 0 R 52 0 R 55 0 R 58 0 R 61 0 R 64 0 R 67 0 R 70 0 R 73 0 R 76 0 R 79 0 R 82 0 R 85 0 R 88 0 R 91 0 R ] /Count 29 /MediaBox [0 0 841 595] >>
++<< /Type /Pages /Kids [ 7 0 R 10 0 R 13 0 R 16 0 R 19 0 R 22 0 R 25 0 R 28 0 R 31 0 R 34 0 R 37 0 R 40 0 R 43 0 R 46 0 R 49 0 R 52 0 R 55 0 R 58 0 R 61 0 R 64 0 R 67 0 R 70 0 R 73 0 R 76 0 R 79 0 R 82 0 R 85 0 R 88 0 R 91 0 R ] /Count 29 >>
+ endobj
+ 4 0 obj
+ <<
+@@ -5402,104 +5402,104 @@ xref
+ 0000000000 65535 f 
+ 0000000021 00000 n 
+ 0000000164 00000 n 
+-0000094428 00000 n 
+-0000094708 00000 n 
+-0000094854 00000 n 
+-0000094887 00000 n 
+-0000000213 00000 n 
+-0000000293 00000 n 
+-0000001975 00000 n 
+-0000001995 00000 n 
+-0000002077 00000 n 
+-0000016296 00000 n 
+-0000016318 00000 n 
+-0000016400 00000 n 
+-0000021263 00000 n 
+-0000021284 00000 n 
+-0000021366 00000 n 
+-0000026365 00000 n 
+-0000026386 00000 n 
+-0000026468 00000 n 
+-0000029997 00000 n 
+-0000030018 00000 n 
+-0000030100 00000 n 
+-0000036799 00000 n 
+-0000036820 00000 n 
+-0000036902 00000 n 
+-0000038638 00000 n 
+-0000038659 00000 n 
+-0000038741 00000 n 
+-0000042890 00000 n 
+-0000042911 00000 n 
+-0000042993 00000 n 
+-0000061383 00000 n 
+-0000061405 00000 n 
+-0000061487 00000 n 
+-0000064833 00000 n 
+-0000064854 00000 n 
+-0000064936 00000 n 
+-0000068280 00000 n 
+-0000068301 00000 n 
+-0000068383 00000 n 
+-0000069066 00000 n 
+-0000069086 00000 n 
+-0000069168 00000 n 
+-0000071035 00000 n 
+-0000071056 00000 n 
+-0000071138 00000 n 
+-0000073826 00000 n 
+-0000073847 00000 n 
+-0000073929 00000 n 
+-0000076251 00000 n 
+-0000076272 00000 n 
+-0000076354 00000 n 
+-0000078352 00000 n 
+-0000078373 00000 n 
+-0000078455 00000 n 
+-0000080423 00000 n 
+-0000080444 00000 n 
+-0000080526 00000 n 
+-0000082048 00000 n 
+-0000082069 00000 n 
+-0000082151 00000 n 
+-0000082861 00000 n 
+-0000082881 00000 n 
+-0000082963 00000 n 
+-0000084055 00000 n 
+-0000084076 00000 n 
+-0000084158 00000 n 
+-0000084734 00000 n 
+-0000084754 00000 n 
+-0000084836 00000 n 
+-0000085425 00000 n 
+-0000085445 00000 n 
+-0000085527 00000 n 
+-0000087095 00000 n 
+-0000087116 00000 n 
+-0000087198 00000 n 
+-0000087877 00000 n 
+-0000087897 00000 n 
+-0000087979 00000 n 
+-0000088513 00000 n 
+-0000088533 00000 n 
+-0000088615 00000 n 
+-0000089911 00000 n 
+-0000089932 00000 n 
+-0000090014 00000 n 
+-0000091288 00000 n 
+-0000091309 00000 n 
+-0000091391 00000 n 
+-0000092675 00000 n 
+-0000092696 00000 n 
+-0000092778 00000 n 
+-0000094407 00000 n 
+-0000104423 00000 n 
+-0000104681 00000 n 
+-0000104765 00000 n 
+-0000104863 00000 n 
+-0000104966 00000 n 
++0000095091 00000 n 
++0000095347 00000 n 
++0000095493 00000 n 
++0000095526 00000 n 
++0000000209 00000 n 
++0000000312 00000 n 
++0000001994 00000 n 
++0000002014 00000 n 
++0000002119 00000 n 
++0000016338 00000 n 
++0000016360 00000 n 
++0000016465 00000 n 
++0000021328 00000 n 
++0000021349 00000 n 
++0000021454 00000 n 
++0000026453 00000 n 
++0000026474 00000 n 
++0000026579 00000 n 
++0000030108 00000 n 
++0000030129 00000 n 
++0000030234 00000 n 
++0000036933 00000 n 
++0000036954 00000 n 
++0000037059 00000 n 
++0000038795 00000 n 
++0000038816 00000 n 
++0000038921 00000 n 
++0000043070 00000 n 
++0000043091 00000 n 
++0000043196 00000 n 
++0000061586 00000 n 
++0000061608 00000 n 
++0000061713 00000 n 
++0000065059 00000 n 
++0000065080 00000 n 
++0000065185 00000 n 
++0000068529 00000 n 
++0000068550 00000 n 
++0000068655 00000 n 
++0000069338 00000 n 
++0000069358 00000 n 
++0000069463 00000 n 
++0000071330 00000 n 
++0000071351 00000 n 
++0000071456 00000 n 
++0000074144 00000 n 
++0000074165 00000 n 
++0000074270 00000 n 
++0000076592 00000 n 
++0000076613 00000 n 
++0000076718 00000 n 
++0000078716 00000 n 
++0000078737 00000 n 
++0000078842 00000 n 
++0000080810 00000 n 
++0000080831 00000 n 
++0000080936 00000 n 
++0000082458 00000 n 
++0000082479 00000 n 
++0000082584 00000 n 
++0000083294 00000 n 
++0000083314 00000 n 
++0000083419 00000 n 
++0000084511 00000 n 
++0000084532 00000 n 
++0000084637 00000 n 
++0000085213 00000 n 
++0000085233 00000 n 
++0000085338 00000 n 
++0000085927 00000 n 
++0000085947 00000 n 
++0000086052 00000 n 
++0000087620 00000 n 
++0000087641 00000 n 
++0000087746 00000 n 
++0000088425 00000 n 
++0000088445 00000 n 
++0000088550 00000 n 
++0000089084 00000 n 
++0000089104 00000 n 
++0000089209 00000 n 
++0000090505 00000 n 
++0000090526 00000 n 
++0000090631 00000 n 
++0000091905 00000 n 
++0000091926 00000 n 
++0000092031 00000 n 
++0000093315 00000 n 
++0000093336 00000 n 
++0000093441 00000 n 
++0000095070 00000 n 
++0000105062 00000 n 
++0000105320 00000 n 
++0000105404 00000 n 
++0000105502 00000 n 
++0000105605 00000 n 
+ trailer
+ << /Size 99 /Info 1 0 R /Root 2 0 R >>
+ startxref
+-105044
++105683
+ %%EOF
