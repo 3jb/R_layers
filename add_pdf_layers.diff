@@ -79,7 +79,7 @@ index 142bbc4..67164e5 100644
      \code{\link{postscript}}.  Defaults to \code{"Helvetica"}.}
    \item{title}{title string to embed as the \samp{/Title} field in the
 diff --git a/src/library/grDevices/src/devPS.c b/src/library/grDevices/src/devPS.c
-index 25d8c9f..d359d83 100644
+index 25d8c9f..5eb853c 100644
 --- a/src/library/grDevices/src/devPS.c
 +++ b/src/library/grDevices/src/devPS.c
 @@ -5362,6 +5362,7 @@ typedef struct {
@@ -539,7 +539,15 @@ index 25d8c9f..d359d83 100644
  }
  
  static void PDF_Rect(double x0, double y0, double x1, double y1,
-@@ -8354,7 +8511,7 @@ SEXP PDF(SEXP args)
+@@ -8336,6 +8493,7 @@ SEXP XFig(SEXP args)
+  *  height	= height in inches
+  *  ps		= pointsize
+  *  onefile     = {TRUE: normal; FALSE: single page per file}
++ *  onepage     = {FALSE: normal; TRUE: single layer per plot}
+  *  title
+  *  fonts
+  *  versionMajor
+@@ -8354,7 +8512,7 @@ SEXP PDF(SEXP args)
  	*bg, *fg, *title, call[] = "PDF", *colormodel;
      const char *afms[5];
      double height, width, ps;
@@ -548,7 +556,7 @@ index 25d8c9f..d359d83 100644
      SEXP fam, fonts;
      Rboolean fillOddEven;
  
-@@ -8381,6 +8538,7 @@ SEXP PDF(SEXP args)
+@@ -8381,6 +8539,7 @@ SEXP PDF(SEXP args)
      height = asReal(CAR(args));	      args = CDR(args);
      ps = asReal(CAR(args));           args = CDR(args);
      onefile = asLogical(CAR(args)); args = CDR(args);
@@ -556,7 +564,7 @@ index 25d8c9f..d359d83 100644
      pagecentre = asLogical(CAR(args));args = CDR(args);
      title = translateChar(asChar(CAR(args))); args = CDR(args);
      fonts = CAR(args); args = CDR(args);
-@@ -8407,7 +8565,7 @@ SEXP PDF(SEXP args)
+@@ -8407,7 +8566,7 @@ SEXP PDF(SEXP args)
  	if (!(dev = (pDevDesc) calloc(1, sizeof(DevDesc))))
  	    return 0;
  	if(!PDFDeviceDriver(dev, file, paper, family, afms, encoding, bg, fg,
