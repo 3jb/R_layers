@@ -20,7 +20,7 @@ function of the layers in pdf().
     >[continue...]
     >dev.off()
 
-Layers will render as expected in viewers such based on poppler
+Layers will render as expected in viewers based on poppler
 and such, also in Adobe reader products.
 
 In Adobe professional products (CS# etc) the layers will appear 
